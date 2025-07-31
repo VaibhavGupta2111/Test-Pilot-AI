@@ -1,177 +1,198 @@
-#!/usr/bin/env python
-import torch
+import re
 from functools import lru_cache
-from transformers import (
-    pipeline,
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    __version__ as _TFM_VERSION
-)
-from sentence_transformers import SentenceTransformer
+from typing import List, Dict, Any
+
+import torch
 import faiss
-import numpy as np
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+from sentence_transformers import SentenceTransformer
 
-print(f"Transformers version: {_TFM_VERSION}")
+# model names & thresholds
+OUTLINE_MODEL   = "gpt2"
+REFINE_MODEL    = "distilgpt2"
+EMBED_MODEL     = "sentence-transformers/all-MiniLM-L6-v2"
+LOW_RISK_THRESH = 5.0
 
-# cap CPU threads to reduce overhead
-torch.set_num_threads(2)
-
-# Models
-GPT2_MODEL            = "gpt2"
-GPTJ_MODEL            = "EleutherAI/gpt-j-6B"
-EMBEDDING_MODEL_NAME  = "sentence-transformers/all-MiniLM-L6-v2"
-LOW_RISK_THRESHOLD    = 5.0
-
-# pick device and dtype
+# device setup for gpu/cpu
 DEVICE = 0 if torch.cuda.is_available() else -1
 DTYPE  = torch.float16 if torch.cuda.is_available() else torch.float32
 
-# Caches
+
 @lru_cache(maxsize=1)
 def load_outline_gen():
-    tokenizer = AutoTokenizer.from_pretrained(GPT2_MODEL)
-    model     = AutoModelForCausalLM.from_pretrained(
-        GPT2_MODEL,
-        torch_dtype=DTYPE,
-        low_cpu_mem_usage=True
+    tok   = AutoTokenizer.from_pretrained(OUTLINE_MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        OUTLINE_MODEL, torch_dtype=DTYPE, low_cpu_mem_usage=True
     )
-    return pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        device=DEVICE,
-        do_sample=True,
-        temperature=0.7,
-        top_p=0.9,
-        max_new_tokens=60,
-        num_return_sequences=1,
-        return_full_text=False
-    )
+    return pipeline("text-generation", model=model, tokenizer=tok, device=DEVICE)
+
 
 @lru_cache(maxsize=1)
 def load_refine_gen():
-    tokenizer = AutoTokenizer.from_pretrained(GPTJ_MODEL)
-    model     = AutoModelForCausalLM.from_pretrained(
-        GPTJ_MODEL,
-        torch_dtype=DTYPE,
-        load_in_8bit=torch.cuda.is_available(),
-        device_map="auto" if torch.cuda.is_available() else None
+    tok   = AutoTokenizer.from_pretrained(REFINE_MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        REFINE_MODEL, torch_dtype=DTYPE, low_cpu_mem_usage=True
     )
-    return pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        device=DEVICE,
-        do_sample=False,
-        max_new_tokens=150,
-        return_full_text=False
-    )
+    return pipeline("text-generation", model=model, tokenizer=tok, device=DEVICE)
+
 
 @lru_cache(maxsize=1)
-def load_embedding_model():
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
+def load_embedder():
+    return SentenceTransformer(EMBED_MODEL)
 
-def build_vector_index(issues: list):
-    """
-    issues: list of dicts, each with 'Issue key', 'Summary', 'Description'
-    Returns: faiss.IndexFlatL2, numpy.ndarray of embeddings, and the issues list
-    """
-    embedder = load_embedding_model()
-    texts = [f"{iss['Summary']} {iss['Description']}" for iss in issues]
-    embeddings = embedder.encode(
-        texts,
-        convert_to_numpy=True,
-        show_progress_bar=True
-    )
-    dim = embeddings.shape[1]
+
+def build_vector_index(
+    issues: List[Dict[str, Any]]
+) -> faiss.IndexFlatL2:
+    texts = [f"{i['Summary']} {i['Description']}" for i in issues]
+    emb   = load_embedder().encode(texts, convert_to_numpy=True)
+    dim   = emb.shape[1]
     index = faiss.IndexFlatL2(dim)
-    index.add(embeddings)
-    return index, embeddings, issues
+    index.add(emb)
+    return index
 
-def semantic_search(issue: dict, index, issues_list: list, top_k: int = 3):
-    """
-    Finds top_k similar issues via cosine / L2 search.
-    Returns: list of issue dicts.
-    """
-    embedder   = load_embedding_model()
-    query_text = f"{issue['Summary']} {issue['Description']}"
-    q_emb       = embedder.encode([query_text], convert_to_numpy=True)
-    distances, idxs = index.search(q_emb, top_k)
+
+def semantic_search(
+    issue: Dict[str, Any],
+    index: faiss.IndexFlatL2,
+    issues_list: List[Dict[str, Any]],
+    top_k: int = 2
+) -> List[Dict[str, Any]]:
+    query = f"{issue['Summary']} {issue['Description']}"
+    q_emb = load_embedder().encode([query], convert_to_numpy=True)
+    _, idxs = index.search(q_emb, top_k)
     return [issues_list[i] for i in idxs[0] if i < len(issues_list)]
 
-def make_outline_prompt(issue: dict, similar_issues: list) -> str:
-    """
-    Builds a prompt that includes similar issues context
-    """
-    prompt = "Here are past similar issues and their contexts:\n"
-    for sim in similar_issues:
-        prompt += (
-            f"- Issue Key: {sim['Issue key']}\n"
-            f"  Summary: {sim['Summary']}\n"
-            f"  Description: {sim['Description']}\n\n"
-        )
+
+def make_outline_prompt(
+    issue: Dict[str, Any],
+    similar: List[Dict[str, Any]]
+) -> str:
+    prompt = (
+        "You are a QA test-case generator. Write each step as a complete, imperative "
+        "sentence describing exactly what the tester does.\n\n"
+        "Here are past similar issues:\n"
+    )
+    for s in similar:
+        prompt += f"- {s['Issue key']}: {s['Summary']}\n  {s['Description']}\n\n"
     prompt += (
-        "Based on these examples, create a concise test‐case outline\n"
-        "for the following issue:\n\n"
+        "Based on these examples, create a concise test-case outline.\n"
+        "Each step must be a full, actionable sentence (e.g. "
+        "\"1. Launch the application by navigating to the home page.\").\n\n"
         f"Issue Key: {issue['Issue key']}\n"
-        f"Summary: {issue['Summary']}\n"
-        f"Description: {issue['Description']}\n\n"
-        "Outline format:\n"
-        "Title: <short title>\n"
+        f"Summary:   {issue['Summary']}\n"
+        f"Description:{issue['Description']}\n\n"
+        "Outline format example:\n"
+        "Title: Verify registration of commercial appliances\n"
         "Steps:\n"
-        "1. <first step>\n"
-        "2. <second step>\n"
-        "...\n"
+        "1. Launch the application by entering the URL in a browser.\n"
+        "2. Navigate to the “Commercial Appliances” section.\n"
+        "3. Select an appliance to register.\n"
+        "…\n\n"
+        "Now generate:\n"
+        "Title:\n"
+        "Steps:\n"
+        "1.\n"
+        "2.\n"
+        "3.\n"
     )
     return prompt
 
-def make_refinement_prompt(issue: dict, outline: str, risk: float) -> str:
+
+def make_refine_prompt(
+    issue: Dict[str, Any],
+    outline: str,
+    risk: float
+) -> str:
     return (
-        "You are a QA expert. Refine the outline below by adding, for each step:\n"
-        "  ✔ Expected: <expected outcome>\n"
-        "Also add a final “Risk Evaluation” note referencing the risk score.\n\n"
-        "ISSUE KEY:\n"
-        f"{issue['Issue key']}\n\n"
-        "OUTLINE:\n"
+        "You are a QA expert. Refine the outline below so that for every step:\n"
+        "  • the step is written in a full sentence, and\n"
+        "  • it is immediately followed by “✔ Expected: <the exact outcome>”.\n"
+        "Finally, include a “Risk Evaluation” paragraph referencing the given risk score.\n\n"
+        f"Issue Key:\n{issue['Issue key']}\n\n"
+        "Outline:\n"
         f"{outline}\n\n"
         f"Risk Score: {risk}\n\n"
-        "Respond exactly in this format:\n"
-        "Test Case Title: <...>\n\n"
+        "Please produce exactly this structure:\n\n"
+        "Test Case Title: <a short, descriptive title>\n\n"
         "Steps and Expected Outcomes:\n"
-        "1. <step>    ✔ Expected: <outcome>\n"
-        "2. ...\n\n"
-        "Risk Evaluation: <text>\n"
+        "1. <full step sentence>    ✔ Expected: <the validation>\n"
+        "2. <full step sentence>    ✔ Expected: <the validation>\n"
+        "...\n\n"
+        "Risk Evaluation: <your evaluation here>\n"
     )
 
+
+def parse_test_case_text(
+    text: str,
+    issue_key: str
+) -> List[Dict[str, Any]]:
+    """
+    Parses lines like '1. action ✔ Expected: outcome' into dict rows.
+    """
+    rows, in_steps = [], False
+    for line in text.splitlines():
+        txt = line.strip()
+        if not in_steps and txt.lower().startswith("steps"):
+            in_steps = True
+            continue
+        if in_steps and txt.lower().startswith("risk evaluation"):
+            break
+        m = re.match(r"(\d+)\.\s*(.+?)\s*✔\s*Expected:\s*(.+)", txt)
+        if m:
+            no, act, exp = m.groups()
+            rows.append({
+                "Issue key":        issue_key,
+                "Step No":          int(no),
+                "Action":           act.strip(),
+                "Expected Outcome": exp.strip()
+            })
+    return rows
+
+
 def generate_test_case(
-    issue: dict,
+    issue: Dict[str, Any],
     risk_score: float,
-    index,
-    issues_list: list,
+    index: faiss.IndexFlatL2,
+    issues_list: List[Dict[str, Any]],
     outline_gen=None,
     refine_gen=None
 ) -> str:
     """
-    Generates an outline + (optional) detailed test case.
-    Uses semantic search to retrieve similar issues before prompting.
+    Returns a markdown string: Test Case Title + numbered steps with ✔ Expected.
     """
     if outline_gen is None:
         outline_gen = load_outline_gen()
     if refine_gen is None:
-        refine_gen = load_refine_gen()
+        refine_gen  = load_refine_gen()
 
-    # 1) Retrieve similar issues for richer context
-    similar = semantic_search(issue, index, issues_list, top_k=3)
+    # 1) find similar examples
+    similar = semantic_search(issue, index, issues_list)
 
-    # 2) Generate the outline with context
-    prompt = make_outline_prompt(issue, similar)
-    outline = outline_gen(prompt)[0]["generated_text"].strip()
+    # 2) generate outline
+    prompt_o = make_outline_prompt(issue, similar)
+    with torch.no_grad():
+        out = outline_gen(
+            prompt_o,
+            max_new_tokens=60,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            num_return_sequences=1,
+            return_full_text=False
+        )
+    outline = out[0]["generated_text"].strip()
 
-    # 3) If risk is low, skip refinement
-    if risk_score < LOW_RISK_THRESHOLD:
-        return outline
+    #refine
+    if risk_score >= LOW_RISK_THRESH:
+        prompt_r = make_refine_prompt(issue, outline, risk_score)
+        with torch.no_grad():
+            ref = refine_gen(
+                prompt_r,
+                max_new_tokens=150,
+                do_sample=False,
+                return_full_text=False
+            )
+        return ref[0]["generated_text"].strip()
 
-    # 4) Refine into full test case
-    ref_prompt = make_refinement_prompt(issue, outline, risk_score)
-    refined = refine_gen(ref_prompt)[0]["generated_text"].strip()
-    return refined
+    return outline
